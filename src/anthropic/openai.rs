@@ -1,6 +1,7 @@
 //! OpenAI Chat Completions 兼容端点
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 
 use axum::{
     Json as JsonExtractor,
@@ -9,7 +10,9 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
+use bytes::Bytes;
 use chrono::Utc;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -74,6 +77,12 @@ pub async fn post_chat_completions(
     State(state): State<AppState>,
     JsonExtractor(payload): JsonExtractor<OpenAIChatRequest>,
 ) -> Response {
+    tracing::info!(
+        model = %payload.model,
+        stream = %payload.stream,
+        message_count = %payload.messages.len(),
+        "Received POST /v1/chat/completions request"
+    );
     let stream = payload.stream;
     let model = payload.model.clone();
     let anthropic_payload = match convert_openai_request(payload) {
@@ -94,6 +103,10 @@ pub async fn post_chat_completions(
 fn convert_openai_request(payload: OpenAIChatRequest) -> Result<MessagesRequest, String> {
     let mut anthropic_messages = Vec::new();
     let mut system_messages = Vec::new();
+    let max_tokens = payload.max_completion_tokens.or(payload.max_tokens).unwrap_or(4096);
+    if max_tokens <= 0 {
+        return Err("max_tokens 必须为正整数".to_string());
+    }
 
     for msg in payload.messages {
         match msg.role.as_str() {
@@ -130,7 +143,9 @@ fn convert_openai_request(payload: OpenAIChatRequest) -> Result<MessagesRequest,
                     ]),
                 });
             }
-            _ => {}
+            _ => {
+                tracing::warn!(role = %msg.role, "忽略未知 OpenAI role");
+            }
         }
     }
 
@@ -163,12 +178,11 @@ fn convert_openai_request(payload: OpenAIChatRequest) -> Result<MessagesRequest,
             .collect()
     });
 
+    let tool_choice = map_openai_tool_choice(payload.tool_choice)?;
+
     Ok(MessagesRequest {
         model: payload.model,
-        max_tokens: payload
-            .max_completion_tokens
-            .or(payload.max_tokens)
-            .unwrap_or(4096),
+        max_tokens,
         messages: anthropic_messages,
         stream: payload.stream,
         system: if system_messages.is_empty() {
@@ -177,11 +191,37 @@ fn convert_openai_request(payload: OpenAIChatRequest) -> Result<MessagesRequest,
             Some(system_messages)
         },
         tools,
-        tool_choice: payload.tool_choice,
+        tool_choice,
         thinking: None,
         output_config: None,
         metadata: None,
     })
+}
+
+fn map_openai_tool_choice(tool_choice: Option<Value>) -> Result<Option<Value>, String> {
+    match tool_choice {
+        None => Ok(None),
+        Some(Value::String(v)) => match v.as_str() {
+            "auto" => Ok(Some(json!({"type":"auto"}))),
+            "required" => Ok(Some(json!({"type":"any"}))),
+            "none" => Ok(None),
+            _ => Err(format!("不支持的 tool_choice 字符串: {}", v)),
+        },
+        Some(Value::Object(v)) => match v.get("type").and_then(|t| t.as_str()) {
+            Some("function") => {
+                let name = v
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .ok_or_else(|| "tool_choice.function.name 不能为空".to_string())?;
+                Ok(Some(json!({"type":"tool","name":name})))
+            }
+            Some("auto") | Some("any") | Some("tool") => Ok(Some(Value::Object(v))),
+            Some(t) => Err(format!("不支持的 tool_choice 类型: {}", t)),
+            None => Err("tool_choice 对象缺少 type 字段".to_string()),
+        },
+        Some(_) => Err("tool_choice 格式不合法".to_string()),
+    }
 }
 
 fn convert_user_content(content: Option<Value>) -> Result<Value, String> {
@@ -209,6 +249,8 @@ fn convert_user_content(content: Option<Value>) -> Result<Value, String> {
                     if let Some(url) = maybe_url {
                         if let Some(image_block) = convert_data_url_to_image_block(url) {
                             blocks.push(image_block);
+                        } else {
+                            tracing::warn!(url = %url, "忽略非 data URL 图片");
                         }
                     }
                 }
@@ -291,6 +333,61 @@ async fn transform_anthropic_response_to_openai(
     model: &str,
 ) -> Response {
     let status = response.status();
+    if !status.is_success() {
+        return response;
+    }
+
+    if stream {
+        let body = response.into_body();
+        let upstream = body.into_data_stream();
+        let model = model.to_string();
+        let stream = futures::stream::unfold(
+            (
+                upstream,
+                OpenAIStreamMapper::new(&model),
+                VecDeque::<Bytes>::new(),
+                false,
+            ),
+            move |(mut upstream, mut mapper, mut pending, mut done)| async move {
+                loop {
+                    if let Some(bytes) = pending.pop_front() {
+                        return Some((Ok::<Bytes, Infallible>(bytes), (upstream, mapper, pending, done)));
+                    }
+                    if done {
+                        return None;
+                    }
+                    match upstream.next().await {
+                        Some(Ok(chunk)) => {
+                            for event in mapper.feed_chunk(chunk.as_ref()) {
+                                pending.push_back(Bytes::from(event));
+                            }
+                        }
+                        Some(Err(err)) => {
+                            tracing::warn!("读取上游流失败: {}", err);
+                            pending.push_back(Bytes::from("data: [DONE]\n\n"));
+                            done = true;
+                        }
+                        None => {
+                            for event in mapper.finish() {
+                                pending.push_back(Bytes::from(event));
+                            }
+                            pending.push_back(Bytes::from("data: [DONE]\n\n"));
+                            done = true;
+                        }
+                    }
+                }
+            },
+        );
+
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    }
+
     let body = response.into_body();
     let bytes = match to_bytes(body, MAX_BODY_SIZE).await {
         Ok(v) => v,
@@ -306,25 +403,6 @@ async fn transform_anthropic_response_to_openai(
         }
     };
 
-    if !status.is_success() {
-        return Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(bytes))
-            .unwrap_or_else(|_| Response::new(Body::empty()));
-    }
-
-    if stream {
-        let sse = convert_stream_body(&bytes, model);
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .header(header::CONNECTION, "keep-alive")
-            .body(Body::from(sse))
-            .unwrap_or_else(|_| Response::new(Body::empty()));
-    }
-
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(v) => {
             let mapped = map_non_stream_response(v, model);
@@ -338,6 +416,214 @@ async fn transform_anthropic_response_to_openai(
             )),
         )
             .into_response(),
+    }
+}
+
+struct OpenAIStreamMapper {
+    model: String,
+    created: i64,
+    chat_id: String,
+    tool_indices: HashMap<i64, usize>,
+    next_tool_index: usize,
+    current_event: Option<String>,
+    current_data_lines: Vec<String>,
+    line_buf: Vec<u8>,
+}
+
+impl OpenAIStreamMapper {
+    fn new(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            created: Utc::now().timestamp(),
+            chat_id: format!("chatcmpl_{}", Uuid::new_v4().to_string().replace('-', "")),
+            tool_indices: HashMap::new(),
+            next_tool_index: 0,
+            current_event: None,
+            current_data_lines: Vec::new(),
+            line_buf: Vec::new(),
+        }
+    }
+
+    fn feed_chunk(&mut self, chunk: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        self.line_buf.extend_from_slice(chunk);
+
+        while let Some(pos) = self.line_buf.iter().position(|b| *b == b'\n') {
+            let mut line_bytes: Vec<u8> = self.line_buf.drain(..=pos).collect();
+            if line_bytes.last() == Some(&b'\n') {
+                line_bytes.pop();
+            }
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes.pop();
+            }
+            let line = String::from_utf8_lossy(&line_bytes);
+            if line.is_empty() {
+                self.flush_record(&mut out);
+                continue;
+            }
+            if line.starts_with(':') {
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("event:") {
+                self.current_event = Some(v.trim_start().to_string());
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("data:") {
+                self.current_data_lines.push(v.trim_start().to_string());
+            }
+        }
+        out
+    }
+
+    fn finish(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.line_buf.is_empty() {
+            let mut line = String::from_utf8_lossy(&self.line_buf).to_string();
+            self.line_buf.clear();
+            line = line.trim_end_matches('\r').to_string();
+            if !line.is_empty() {
+                if let Some(v) = line.strip_prefix("event:") {
+                    self.current_event = Some(v.trim_start().to_string());
+                } else if let Some(v) = line.strip_prefix("data:") {
+                    self.current_data_lines.push(v.trim_start().to_string());
+                }
+            }
+        }
+        self.flush_record(&mut out);
+        out
+    }
+
+    fn flush_record(&mut self, out: &mut Vec<String>) {
+        let event = self.current_event.take();
+        let data_raw = if self.current_data_lines.is_empty() {
+            String::new()
+        } else {
+            self.current_data_lines.join("\n")
+        };
+        self.current_data_lines.clear();
+
+        let Some(event) = event else {
+            return;
+        };
+        if event == "ping" || data_raw.is_empty() || data_raw == "[DONE]" {
+            return;
+        }
+        let Ok(data) = serde_json::from_str::<Value>(&data_raw) else {
+            return;
+        };
+        self.handle_event(&event, &data, out);
+    }
+
+    fn push_chunk(&self, out: &mut Vec<String>, delta: Value, finish_reason: Value) {
+        out.push(format!(
+            "data: {}\n\n",
+            json!({
+                "id": self.chat_id,
+                "object":"chat.completion.chunk",
+                "created": self.created,
+                "model": self.model,
+                "choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]
+            })
+        ));
+    }
+
+    fn handle_event(&mut self, event: &str, data: &Value, out: &mut Vec<String>) {
+        match event {
+            "message_start" => {
+                if let Some(id) = data
+                    .get("message")
+                    .and_then(|m| m.get("id"))
+                    .and_then(|v| v.as_str())
+                {
+                    self.chat_id = format!("chatcmpl_{}", id.replace('-', ""));
+                }
+                self.push_chunk(out, json!({"role":"assistant"}), Value::Null);
+            }
+            "content_block_start" => {
+                if data
+                    .get("content_block")
+                    .and_then(|v| v.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some("tool_use")
+                {
+                    let idx = data.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
+                    let tool_idx = *self.tool_indices.entry(idx).or_insert_with(|| {
+                        let i = self.next_tool_index;
+                        self.next_tool_index += 1;
+                        i
+                    });
+                    self.push_chunk(
+                        out,
+                        json!({
+                            "tool_calls":[
+                                {
+                                    "index": tool_idx,
+                                    "id": data.get("content_block").and_then(|v| v.get("id")).and_then(|v| v.as_str()).unwrap_or(""),
+                                    "type":"function",
+                                    "function":{
+                                        "name": data.get("content_block").and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or(""),
+                                        "arguments":""
+                                    }
+                                }
+                            ]
+                        }),
+                        Value::Null,
+                    );
+                }
+            }
+            "content_block_delta" => {
+                let delta_type = data
+                    .get("delta")
+                    .and_then(|d| d.get("type"))
+                    .and_then(|v| v.as_str());
+                match delta_type {
+                    Some("text_delta") => {
+                        if let Some(text) = data
+                            .get("delta")
+                            .and_then(|d| d.get("text"))
+                            .and_then(|v| v.as_str())
+                        {
+                            self.push_chunk(out, json!({"content":text}), Value::Null);
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        let idx = data.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
+                        let tool_idx = *self.tool_indices.entry(idx).or_insert_with(|| {
+                            let i = self.next_tool_index;
+                            self.next_tool_index += 1;
+                            i
+                        });
+                        let partial = data
+                            .get("delta")
+                            .and_then(|d| d.get("partial_json"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        self.push_chunk(
+                            out,
+                            json!({
+                                "tool_calls":[
+                                    {
+                                        "index":tool_idx,
+                                        "function":{"arguments":partial}
+                                    }
+                                ]
+                            }),
+                            Value::Null,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            "message_delta" => {
+                let stop_reason = data
+                    .get("delta")
+                    .and_then(|v| v.get("stop_reason"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("end_turn");
+                self.push_chunk(out, json!({}), json!(map_finish_reason(stop_reason)));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -408,193 +694,14 @@ fn map_non_stream_response(anthropic: Value, model: &str) -> Value {
 }
 
 fn convert_stream_body(bytes: &[u8], model: &str) -> String {
-    let input = String::from_utf8_lossy(bytes);
-    let created = Utc::now().timestamp();
-    let mut chat_id = format!("chatcmpl_{}", Uuid::new_v4().to_string().replace('-', ""));
-    let mut tool_indices: HashMap<i64, usize> = HashMap::new();
-    let mut next_tool_index = 0usize;
+    let mut mapper = OpenAIStreamMapper::new(model);
     let mut output = String::new();
-
-    for record in input.split("\n\n") {
-        if record.trim().is_empty() {
-            continue;
-        }
-        let mut event_name: Option<&str> = None;
-        let mut data_raw = String::new();
-
-        for line in record.lines() {
-            if let Some(v) = line.strip_prefix("event: ") {
-                event_name = Some(v.trim());
-            } else if let Some(v) = line.strip_prefix("data: ") {
-                if !data_raw.is_empty() {
-                    data_raw.push('\n');
-                }
-                data_raw.push_str(v);
-            }
-        }
-
-        let Some(event) = event_name else {
-            continue;
-        };
-        if event == "ping" || data_raw.is_empty() {
-            continue;
-        }
-
-        let Ok(data) = serde_json::from_str::<Value>(&data_raw) else {
-            continue;
-        };
-
-        match event {
-            "message_start" => {
-                if let Some(id) = data
-                    .get("message")
-                    .and_then(|m| m.get("id"))
-                    .and_then(|v| v.as_str())
-                {
-                    chat_id = id.to_string();
-                }
-                output.push_str(&format!(
-                    "data: {}\n\n",
-                    json!({
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"role":"assistant"},
-                            "finish_reason": Value::Null
-                        }]
-                    })
-                ));
-            }
-            "content_block_start" => {
-                if data
-                    .get("content_block")
-                    .and_then(|v| v.get("type"))
-                    .and_then(|v| v.as_str())
-                    == Some("tool_use")
-                {
-                    let idx = data.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
-                    let tool_idx = *tool_indices.entry(idx).or_insert_with(|| {
-                        let i = next_tool_index;
-                        next_tool_index += 1;
-                        i
-                    });
-                    output.push_str(&format!(
-                        "data: {}\n\n",
-                        json!({
-                            "id": chat_id,
-                            "object":"chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices":[
-                                {
-                                    "index":0,
-                                    "delta":{
-                                        "tool_calls":[
-                                            {
-                                                "index": tool_idx,
-                                                "id": data.get("content_block").and_then(|v| v.get("id")).and_then(|v| v.as_str()).unwrap_or(""),
-                                                "type":"function",
-                                                "function":{
-                                                    "name": data.get("content_block").and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or(""),
-                                                    "arguments":""
-                                                }
-                                            }
-                                        ]
-                                    },
-                                    "finish_reason": Value::Null
-                                }
-                            ]
-                        })
-                    ));
-                }
-            }
-            "content_block_delta" => {
-                let delta_type = data
-                    .get("delta")
-                    .and_then(|d| d.get("type"))
-                    .and_then(|v| v.as_str());
-                match delta_type {
-                    Some("text_delta") => {
-                        if let Some(text) = data
-                            .get("delta")
-                            .and_then(|d| d.get("text"))
-                            .and_then(|v| v.as_str())
-                        {
-                            output.push_str(&format!(
-                                "data: {}\n\n",
-                                json!({
-                                    "id": chat_id,
-                                    "object":"chat.completion.chunk",
-                                    "created": created,
-                                    "model": model,
-                                    "choices":[{"index":0,"delta":{"content":text},"finish_reason":Value::Null}]
-                                })
-                            ));
-                        }
-                    }
-                    Some("input_json_delta") => {
-                        let idx = data.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
-                        let tool_idx = *tool_indices.entry(idx).or_insert_with(|| {
-                            let i = next_tool_index;
-                            next_tool_index += 1;
-                            i
-                        });
-                        let partial = data
-                            .get("delta")
-                            .and_then(|d| d.get("partial_json"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        output.push_str(&format!(
-                            "data: {}\n\n",
-                            json!({
-                                "id": chat_id,
-                                "object":"chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices":[
-                                    {
-                                        "index":0,
-                                        "delta":{
-                                            "tool_calls":[
-                                                {
-                                                    "index":tool_idx,
-                                                    "function":{"arguments":partial}
-                                                }
-                                            ]
-                                        },
-                                        "finish_reason":Value::Null
-                                    }
-                                ]
-                            })
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-            "message_delta" => {
-                let stop_reason = data
-                    .get("delta")
-                    .and_then(|v| v.get("stop_reason"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("end_turn");
-                output.push_str(&format!(
-                    "data: {}\n\n",
-                    json!({
-                        "id": chat_id,
-                        "object":"chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices":[{"index":0,"delta":{},"finish_reason":map_finish_reason(stop_reason)}]
-                    })
-                ));
-            }
-            _ => {}
-        }
+    for event in mapper.feed_chunk(bytes) {
+        output.push_str(&event);
     }
-
+    for event in mapper.finish() {
+        output.push_str(&event);
+    }
     output.push_str("data: [DONE]\n\n");
     output
 }
@@ -642,5 +749,52 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert!(output.contains("\"chat.completion.chunk\""));
         assert!(output.contains("\"content\":\"Hi\""));
         assert!(output.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn stream_mapping_supports_crlf() {
+        let sse = "event: message_start\r\ndata: {\"message\":{\"id\":\"msg_abc\"}}\r\n\r\n\
+event: content_block_delta\r\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\r\n\r\n";
+        let output = convert_stream_body(sse.as_bytes(), "claude-sonnet-5");
+        assert!(output.contains("\"content\":\"Hi\""));
+        assert!(output.contains("\"id\":\"chatcmpl_msg_abc\""));
+    }
+
+    #[test]
+    fn tool_choice_is_mapped() {
+        assert_eq!(
+            map_openai_tool_choice(Some(json!("auto"))).unwrap(),
+            Some(json!({"type":"auto"}))
+        );
+        assert_eq!(
+            map_openai_tool_choice(Some(json!("required"))).unwrap(),
+            Some(json!({"type":"any"}))
+        );
+        assert_eq!(
+            map_openai_tool_choice(Some(json!({"type":"function","function":{"name":"search"}})))
+                .unwrap(),
+            Some(json!({"type":"tool","name":"search"}))
+        );
+        assert_eq!(map_openai_tool_choice(Some(json!("none"))).unwrap(), None);
+    }
+
+    #[test]
+    fn reject_non_positive_max_tokens() {
+        let req = OpenAIChatRequest {
+            model: "claude-sonnet-5".to_string(),
+            messages: vec![OpenAIMessage {
+                role: "user".to_string(),
+                content: Some(json!("hello")),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            max_tokens: Some(0),
+            max_completion_tokens: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let err = convert_openai_request(req).unwrap_err();
+        assert!(err.contains("max_tokens"));
     }
 }
