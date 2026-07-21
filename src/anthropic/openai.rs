@@ -693,6 +693,7 @@ fn map_non_stream_response(anthropic: Value, model: &str) -> Value {
     })
 }
 
+#[cfg(test)]
 fn convert_stream_body(bytes: &[u8], model: &str) -> String {
     let mut mapper = OpenAIStreamMapper::new(model);
     let mut output = String::new();
