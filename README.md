@@ -378,6 +378,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 |------|------|------|
 | `/v1/models` | GET | 获取可用模型列表 |
 | `/v1/messages` | POST | 创建消息（对话） |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions 兼容端点（支持 stream / 非 stream） |
 | `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
 
 ### Claude Code 兼容端点 (/cc/v1)
