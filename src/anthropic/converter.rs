@@ -80,7 +80,17 @@ Complete all chunked operations without commentary.";
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
-    if model_lower.contains("sonnet") {
+    if model_lower.contains("gpt-5.6") || model_lower.contains("gpt-5-6") {
+        if model_lower.contains("sol") {
+            Some("gpt-5.6-sol".to_string())
+        } else if model_lower.contains("terra") {
+            Some("gpt-5.6-terra".to_string())
+        } else if model_lower.contains("luna") {
+            Some("gpt-5.6-luna".to_string())
+        } else {
+            Some(model.to_string())
+        }
+    } else if model_lower.contains("sonnet") {
         if model_lower.contains("sonnet-5") {
             Some("claude-sonnet-5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
