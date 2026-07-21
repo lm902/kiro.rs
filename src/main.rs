@@ -202,6 +202,7 @@ async fn main() {
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
+    tracing::info!("  POST /v1/chat/completions");
     tracing::info!("  POST /v1/messages/count_tokens");
     if admin_key_valid {
         tracing::info!("Admin API:");
