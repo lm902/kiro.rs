@@ -101,7 +101,7 @@ pub async fn post_chat_completions(
 }
 
 fn convert_openai_request(payload: OpenAIChatRequest) -> Result<MessagesRequest, String> {
-    let mut anthropic_messages = Vec::new();
+    let mut anthropic_messages: Vec<AnthropicMessage> = Vec::new();
     let mut system_messages = Vec::new();
     let max_tokens = payload.max_completion_tokens.or(payload.max_tokens).unwrap_or(4096);
     if max_tokens <= 0 {
@@ -116,31 +116,95 @@ fn convert_openai_request(payload: OpenAIChatRequest) -> Result<MessagesRequest,
                     system_messages.push(SystemMessage { text });
                 }
             }
-            "user" => {
+            "user" | "tool" => {
+                let mut new_blocks = Vec::new();
+                if msg.role == "tool" {
+                    let tool_use_id = msg
+                        .tool_call_id
+                        .ok_or_else(|| "tool 消息缺少 tool_call_id".to_string())?;
+                    new_blocks.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": extract_text_content(msg.content.as_ref())
+                    }));
+                } else {
+                    let user_content = convert_user_content(msg.content)?;
+                    if let Some(arr) = user_content.as_array() {
+                        new_blocks.extend(arr.clone());
+                    } else if let Some(s) = user_content.as_str() {
+                        if !s.is_empty() {
+                            new_blocks.push(json!({"type":"text","text":s}));
+                        }
+                    } else {
+                        new_blocks.push(json!({"type":"text","text":user_content.to_string()}));
+                    }
+                }
+
+                if let Some(last_msg) = anthropic_messages.last_mut() {
+                    if last_msg.role == "user" {
+                        let mut current_blocks = Vec::new();
+                        if let Some(arr) = last_msg.content.as_array() {
+                            current_blocks.extend(arr.clone());
+                        } else if let Some(s) = last_msg.content.as_str() {
+                            if !s.is_empty() {
+                                current_blocks.push(json!({"type":"text","text":s}));
+                            }
+                        } else {
+                            current_blocks.push(json!({"type":"text","text":last_msg.content.to_string()}));
+                        }
+                        current_blocks.extend(new_blocks);
+                        last_msg.content = Value::Array(current_blocks);
+                        continue;
+                    }
+                }
+
                 anthropic_messages.push(AnthropicMessage {
                     role: "user".to_string(),
-                    content: convert_user_content(msg.content)?,
+                    content: Value::Array(new_blocks),
                 });
             }
             "assistant" => {
+                let mut new_blocks = Vec::new();
+                let ast_content = convert_assistant_content(msg.content, msg.tool_calls);
+                if let Some(arr) = ast_content.as_array() {
+                    new_blocks.extend(arr.clone());
+                } else if let Some(s) = ast_content.as_str() {
+                    if s != " " {
+                        new_blocks.push(json!({"type":"text","text":s}));
+                    }
+                } else {
+                    new_blocks.push(json!({"type":"text","text":ast_content.to_string()}));
+                }
+
+                if let Some(last_msg) = anthropic_messages.last_mut() {
+                    if last_msg.role == "assistant" {
+                        let mut current_blocks = Vec::new();
+                        if let Some(arr) = last_msg.content.as_array() {
+                            current_blocks.extend(arr.clone());
+                        } else if let Some(s) = last_msg.content.as_str() {
+                            if s != " " {
+                                current_blocks.push(json!({"type":"text","text":s}));
+                            }
+                        } else {
+                            current_blocks.push(json!({"type":"text","text":last_msg.content.to_string()}));
+                        }
+                        current_blocks.extend(new_blocks);
+                        last_msg.content = if current_blocks.is_empty() {
+                            Value::String(" ".to_string())
+                        } else {
+                            Value::Array(current_blocks)
+                        };
+                        continue;
+                    }
+                }
+
                 anthropic_messages.push(AnthropicMessage {
                     role: "assistant".to_string(),
-                    content: convert_assistant_content(msg.content, msg.tool_calls),
-                });
-            }
-            "tool" => {
-                let tool_use_id = msg
-                    .tool_call_id
-                    .ok_or_else(|| "tool 消息缺少 tool_call_id".to_string())?;
-                anthropic_messages.push(AnthropicMessage {
-                    role: "user".to_string(),
-                    content: json!([
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": extract_text_content(msg.content.as_ref())
-                        }
-                    ]),
+                    content: if new_blocks.is_empty() {
+                        Value::String(" ".to_string())
+                    } else {
+                        Value::Array(new_blocks)
+                    },
                 });
             }
             _ => {
