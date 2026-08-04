@@ -75,6 +75,42 @@ pub async fn get_models() -> impl IntoResponse {
 
     let models = vec![
         Model {
+            id: "glm-5".to_string(),
+            object: "model".to_string(),
+            created: 1782777600, // Jun 30, 2026
+            owned_by: "zhipuai".to_string(),
+            display_name: "GLM 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 1_000_000,
+        },
+        Model {
+            id: "gpt-5.6-sol".to_string(),
+            object: "model".to_string(),
+            created: 1782777600, // Jun 30, 2026
+            owned_by: "openai".to_string(),
+            display_name: "GPT 5.6 Sol".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "gpt-5.6-terra".to_string(),
+            object: "model".to_string(),
+            created: 1782777600, // Jun 30, 2026
+            owned_by: "openai".to_string(),
+            display_name: "GPT 5.6 Terra".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "gpt-5.6-luna".to_string(),
+            object: "model".to_string(),
+            created: 1782777600, // Jun 30, 2026
+            owned_by: "openai".to_string(),
+            display_name: "GPT 5.6 Luna".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
             id: "claude-opus-5".to_string(),
             object: "model".to_string(),
             created: 1782777600, // Jun 30, 2026
